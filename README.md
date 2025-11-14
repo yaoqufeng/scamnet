@@ -4,7 +4,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/avotcorg/scamnet/main/main.sh)
 ```
 ### 全协议
 ```
-bash <(curl -Ls https://raw.githubusercontent.com/avotcorg/scamnet/main/allmain.sh )
+bash <(curl -Ls https://raw.githubusercontent.com/yaoqufeng/scamnet/refs/heads/main/allmain.sh )
 ```
 ### 功能简介
 生成弱口令字典
